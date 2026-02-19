@@ -58,7 +58,7 @@ PIR_ACTIVE_MINUTES_DEFAULT = 5
 # Regel 2: setOccupied = true wenn in den letzten RULE2_WINDOW_MINUTES Min die PIR in Summe RULE2_TRIGGER_MINUTES Min auf trigger stand
 RULE2_WINDOW_MINUTES = 10
 RULE2_TRIGGER_MINUTES = 5
-# Regel 3: setOccupied = false wenn occupied = true und in den letzten 30 Min kein Trigger ausgelöst wurde
+# Regel 3: setOccupied = false wenn occupied = true und PIR seit mehr als 30 Min auf "normal" steht
 RULE3_WINDOW_MINUTES = 30
 
 
@@ -589,16 +589,6 @@ def main():
                 session, base_url, dev_uid, TELEMETRY_KEY_PIR, window_start_ms, now_ms
             )
             trigger_sum_ms = trigger_duration_ms(pir_entries, now_ms)
-            # Regel 3 (nur bei occupied = true): Trigger in den letzten 30 Min?
-            trigger_in_last_30min = None
-            if occupied is True:
-                window_30_start_ms = now_ms - RULE3_WINDOW_MINUTES * 60 * 1000
-                entries_30 = get_telemetry_timeseries(
-                    session, base_url, dev_uid, TELEMETRY_KEY_PIR, window_30_start_ms, now_ms
-                )
-                trigger_in_last_30min = any(
-                    is_pir_active(e.get("value")) for e in entries_30 if isinstance(e, dict)
-                )
             ws202_devices.append({
                 "device_id": dev_uid,
                 "device_name": dev_name,
@@ -606,13 +596,12 @@ def main():
                 "pir_value": pir_value,
                 "pir_ts": pir_ts,
                 "trigger_sum_ms": trigger_sum_ms,
-                "trigger_in_last_30min": trigger_in_last_30min,
             })
 
         # setOccupied: Regel 1 und 2 nur wenn occupied = false; Regel 3 nur wenn occupied = true
         # Regel 1: PIR aktiv und ts älter als pir_minutes
         # Regel 2: In den letzten 10 Min war PIR in Summe >= 5 Min auf trigger
-        # Regel 3: In den letzten 30 Min kein Trigger → setOccupied = false
+        # Regel 3: PIR seit mehr als 30 Min auf "normal" → setOccupied = false
         set_occupied = ""
         set_occupied_rule = ""
         if occupied is False:
@@ -636,11 +625,17 @@ def main():
             if rules_applied:
                 set_occupied_rule = ", ".join(sorted(rules_applied))
         elif occupied is True:
-            # Regel 3: kein Trigger in den letzten 30 Min → setOccupied = false
-            any_trigger_in_30min = any(
-                d.get("trigger_in_last_30min", False) for d in ws202_devices
+            # Regel 3: PIR seit mehr als 30 Min "normal" = letztes PIR-Ereignis (raumweit) ist "normal" und älter als 30 Min
+            rule3_min_ms = RULE3_WINDOW_MINUTES * 60 * 1000
+            latest_ts = max((d.get("pir_ts") or 0) for d in ws202_devices)
+            latest_device = next((d for d in ws202_devices if (d.get("pir_ts") or 0) == latest_ts), None)
+            rule3_applies = (
+                latest_device is not None
+                and latest_ts > 0
+                and not is_pir_active(latest_device.get("pir_value"))
+                and (now_ms - latest_ts) >= rule3_min_ms
             )
-            if ws202_devices and not any_trigger_in_30min:
+            if rule3_applies:
                 set_occupied = "false"
                 set_occupied_rule = "Regel 3"
                 for d in ws202_devices:
