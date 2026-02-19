@@ -117,6 +117,11 @@ def parse_arguments():
         help="ThingsBoard-Anmeldung aus .env/CLI statt aus MSSQL",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug-Ausgaben (z.B. MSSQL-Verbindung, TB-Anmeldedaten aus DB)",
+    )
+    parser.add_argument(
         "--mssql-server",
         default=MSSQL_SERVER,
         help="MSSQL Server",
@@ -163,20 +168,35 @@ def get_tb_credentials_from_mssql(
     database: str,
     user: str,
     password: str,
+    debug: bool = False,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Holt tb_username und tb_password aus MSSQL customer_settings für die gegebene customer_id."""
+    def _log(msg: str) -> None:
+        if debug:
+            print(f"   [DEBUG] TB aus MSSQL: {msg}", file=sys.stderr)
+
+    def _fail(reason: str) -> Tuple[Optional[str], Optional[str]]:
+        print(f"   Ursache: {reason}", file=sys.stderr)
+        return None, None
+
     try:
         import pyodbc
-    except ImportError:
-        return None, None
-    if not all([server, database, user, password]):
-        return None, None
+    except ImportError as e:
+        _log(f"pyodbc nicht installiert: {e}")
+        return _fail(f"pyodbc nicht installiert: {e}")
+
+    missing = [k for k, v in [("server", server), ("database", database), ("user", user), ("password", password)] if not (v or "").strip()]
+    if missing:
+        _log(f"Fehlende Verbindungsdaten: {', '.join(missing)}")
+        return _fail(f"Fehlende Verbindungsdaten: {', '.join(missing)} (MSSQL_SERVER, MSSQL_DATABASE, MSSQL_USER, MSSQL_PASSWORD in .env?)")
+
     drivers = [
         "ODBC Driver 18 for SQL Server",
         "ODBC Driver 17 for SQL Server",
         "FreeTDS",
     ]
     conn = None
+    last_err: Optional[Exception] = None
     for driver in drivers:
         try:
             conn_str = (
@@ -184,16 +204,26 @@ def get_tb_credentials_from_mssql(
                 f"UID={user};PWD={password};Encrypt=yes;TrustServerCertificate=no;"
             )
             conn = pyodbc.connect(conn_str)
+            if debug:
+                _log(f"Verbindung mit Treiber '{driver}' hergestellt.")
             break
-        except Exception:
+        except Exception as e:
+            last_err = e
+            _log(f"Treiber '{driver}' (Encrypt=yes): {e}")
             try:
                 conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password};"
                 conn = pyodbc.connect(conn_str)
+                if debug:
+                    _log(f"Verbindung mit Treiber '{driver}' (ohne Encrypt) hergestellt.")
                 break
-            except Exception:
+            except Exception as e2:
+                last_err = e2
+                _log(f"Treiber '{driver}' (ohne Encrypt): {e2}")
                 continue
     if not conn:
-        return None, None
+        _log(f"Kein Treiber konnte verbinden. Letzter Fehler: {last_err}")
+        return _fail(f"MSSQL-Verbindung fehlgeschlagen. Letzter Fehler: {last_err}")
+
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -203,10 +233,17 @@ def get_tb_credentials_from_mssql(
         row = cursor.fetchone()
         cursor.close()
         if row and len(row) >= 2:
-            return (str(row[0]).strip() if row[0] else None, str(row[1]) if row[1] else None)
-        return None, None
-    except Exception:
-        return None, None
+            uname = str(row[0]).strip() if row[0] else None
+            pwd = str(row[1]) if row[1] else None
+            if not uname or not pwd:
+                _log(f"Eintrag für customer_id={customer_id} gefunden, aber tb_username oder tb_password leer.")
+                return _fail("Eintrag in customer_settings hat leeres tb_username oder tb_password.")
+            return (uname, pwd)
+        _log(f"Kein Eintrag in customer_settings für customer_id={customer_id} (SELECT tb_username, tb_password).")
+        return _fail(f"Kein Eintrag in customer_settings für customer_id={customer_id} (Spalten tb_username, tb_password).")
+    except Exception as e:
+        _log(f"Abfrage fehlgeschlagen: {e}")
+        return _fail(f"Abfrage fehlgeschlagen: {e}")
     finally:
         if conn:
             conn.close()
@@ -445,6 +482,9 @@ def main():
     print("=" * 80)
 
     args = parse_arguments()
+    
+    print("args: ", args)
+    
     customer_id = (args.customer_id or "").strip()
     if not customer_id:
         print("❌ --customer-id fehlt.", file=sys.stderr)
@@ -464,7 +504,10 @@ def main():
             args.mssql_database,
             args.mssql_user,
             args.mssql_password,
+            debug=getattr(args, "debug", False),
         )
+
+
         if not username or not password:
             print("❌ ThingsBoard-Anmeldung aus Datenbank fehlgeschlagen.", file=sys.stderr)
             sys.exit(1)
