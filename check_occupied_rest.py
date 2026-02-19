@@ -664,7 +664,7 @@ def main():
             "ws202_devices": ws202_devices,
         })
 
-    # Optional: occupied auf true setzen, wenn PIR länger als pir_minutes aktiv
+    # Optional: occupied auf true setzen, wenn PIR länger als pir_minutes aktiv (Regel 1/2)
     for r in rows:
         if r.get("setOccupied") != "true":
             continue
@@ -675,6 +675,16 @@ def main():
             print(f"   ✅ {r['asset_name']}: occupied auf true gesetzt (PIR > {args.pir_minutes} Min aktiv)", file=sys.stderr)
         else:
             print(f"   ❌ {r['asset_name']}: occupied setzen fehlgeschlagen", file=sys.stderr)
+
+    # Regel 3: occupied auf false setzen, wenn 30 Min kein Trigger
+    for r in rows:
+        if r.get("setOccupied") != "false" or r.get("setOccupied_rule") != "Regel 3":
+            continue
+        if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, False):
+            r["occupied"] = False
+            print(f"   ✅ {r['asset_name']}: occupied auf false gesetzt (Regel 3: 30 Min kein Trigger)", file=sys.stderr)
+        else:
+            print(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 3)", file=sys.stderr)
 
     # Ausgabe
     out_file = open(args.output_file, "w", encoding="utf-8", newline="") if args.output_file else sys.stdout
