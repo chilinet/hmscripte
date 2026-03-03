@@ -36,6 +36,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+
+def _log_line(msg: str) -> None:
+    """Schreibt eine Zeile mit Timestamp auf stderr (Logausgabe)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", file=sys.stderr)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,8 +64,8 @@ PIR_ACTIVE_MINUTES_DEFAULT = 5
 # Regel 2: setOccupied = true wenn in den letzten RULE2_WINDOW_MINUTES Min die PIR in Summe RULE2_TRIGGER_MINUTES Min auf trigger stand
 RULE2_WINDOW_MINUTES = 10
 RULE2_TRIGGER_MINUTES = 5
-# Regel 3: setOccupied = false wenn occupied = true und PIR seit mehr als 30 Min auf "normal" steht
-RULE3_WINDOW_MINUTES = 30
+# Regel 3: setOccupied = false wenn occupied = true und PIR seit mehr als 60 Min auf "normal" steht
+RULE3_WINDOW_MINUTES = 60
 
 
 def parse_arguments():
@@ -173,10 +179,10 @@ def get_tb_credentials_from_mssql(
     """Holt tb_username und tb_password aus MSSQL customer_settings für die gegebene customer_id."""
     def _log(msg: str) -> None:
         if debug:
-            print(f"   [DEBUG] TB aus MSSQL: {msg}", file=sys.stderr)
+            _log_line(f"   [DEBUG] TB aus MSSQL: {msg}")
 
     def _fail(reason: str) -> Tuple[Optional[str], Optional[str]]:
-        print(f"   Ursache: {reason}", file=sys.stderr)
+        _log_line(f"   Ursache: {reason}")
         return None, None
 
     try:
@@ -477,27 +483,24 @@ def device_uid(device: Dict[str, Any]) -> str:
 
 
 def main():
-    print("=" * 80)
-    print("CHECK OCCUPIED (REST)")
-    print("=" * 80)
+    _log_line("=" * 80)
+    _log_line("CHECK OCCUPIED (REST)")
+    _log_line("=" * 80)
 
     args = parse_arguments()
-    
-    print("args: ", args)
-    
     customer_id = (args.customer_id or "").strip()
     if not customer_id:
-        print("❌ --customer-id fehlt.", file=sys.stderr)
+        _log_line("❌ --customer-id fehlt.")
         sys.exit(1)
 
     base_url = normalize_base_url(args.thingboard_url)
     if not base_url:
-        print("❌ ThingsBoard-URL fehlt.", file=sys.stderr)
+        _log_line("❌ ThingsBoard-URL fehlt.")
         sys.exit(1)
 
     credentials_from_db = not getattr(args, "no_credentials_from_db", False)
     if credentials_from_db:
-        print(f"\n📋 Hole ThingsBoard-Anmeldedaten aus MSSQL (customer_settings, customer_id={customer_id})...")
+        _log_line(f"📋 Hole ThingsBoard-Anmeldedaten aus MSSQL (customer_settings, customer_id={customer_id})...")
         username, password = get_tb_credentials_from_mssql(
             customer_id,
             args.mssql_server,
@@ -509,13 +512,13 @@ def main():
 
 
         if not username or not password:
-            print("❌ ThingsBoard-Anmeldung aus Datenbank fehlgeschlagen.", file=sys.stderr)
+            _log_line("❌ ThingsBoard-Anmeldung aus Datenbank fehlgeschlagen.")
             sys.exit(1)
-        print("   ✅ Anmeldedaten aus customer_settings geladen")
+        _log_line("   ✅ Anmeldedaten aus customer_settings geladen")
     else:
         username = (args.thingboard_username or "").strip()
         if not username:
-            print("❌ THINGBOARD_USERNAME fehlt (oder --thingboard-username).", file=sys.stderr)
+            _log_line("❌ THINGBOARD_USERNAME fehlt (oder --thingboard-username).")
             sys.exit(1)
         password = args.thingboard_password
         if not password:
@@ -529,18 +532,18 @@ def main():
         token = tb_login(session, base_url, username, password)
         session.headers["X-Authorization"] = f"Bearer {token}"
     except Exception as e:
-        print(f"❌ Login: {e}", file=sys.stderr)
+        _log_line(f"❌ Login: {e}")
         sys.exit(1)
 
-    print(f"\n📋 Lade Assets für Customer {customer_id}...")
+    _log_line(f"📋 Lade Assets für Customer {customer_id}...")
     try:
         assets = get_customer_assets(session, base_url, customer_id, args.page_size)
     except Exception as e:
-        print(f"❌ {e}", file=sys.stderr)
+        _log_line(f"❌ {e}")
         sys.exit(1)
-    print(f"   {len(assets)} Assets gefunden")
+    _log_line(f"   {len(assets)} Assets gefunden")
 
-    print(f"\n📋 Lade Device-Profile...")
+    _log_line("📋 Lade Device-Profile...")
     profile_map = get_device_profile_map(session, base_url, args.page_size)
 
     rows: List[Dict[str, Any]] = []
@@ -601,7 +604,7 @@ def main():
         # setOccupied: Regel 1 und 2 nur wenn occupied = false; Regel 3 nur wenn occupied = true
         # Regel 1: PIR aktiv und ts älter als pir_minutes
         # Regel 2: In den letzten 10 Min war PIR in Summe >= 5 Min auf trigger
-        # Regel 3: PIR seit mehr als 30 Min auf "normal" → setOccupied = false
+        # Regel 3: PIR seit mehr als 60 Min auf "normal" → setOccupied = false
         set_occupied = ""
         set_occupied_rule = ""
         if occupied is False:
@@ -625,7 +628,7 @@ def main():
             if rules_applied:
                 set_occupied_rule = ", ".join(sorted(rules_applied))
         elif occupied is True:
-            # Regel 3: PIR seit mehr als 30 Min "normal" = letztes PIR-Ereignis (raumweit) ist "normal" und älter als 30 Min
+            # Regel 3: PIR seit mehr als 60 Min "normal" = letztes PIR-Ereignis (raumweit) ist "normal" und älter als 60 Min
             rule3_min_ms = RULE3_WINDOW_MINUTES * 60 * 1000
             latest_ts = max((d.get("pir_ts") or 0) for d in ws202_devices)
             latest_device = next((d for d in ws202_devices if (d.get("pir_ts") or 0) == latest_ts), None)
@@ -667,19 +670,19 @@ def main():
             continue
         if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, True):
             r["occupied"] = True
-            print(f"   ✅ {r['asset_name']}: occupied auf true gesetzt (PIR > {args.pir_minutes} Min aktiv)", file=sys.stderr)
+            _log_line(f"   ✅ {r['asset_name']}: occupied auf true gesetzt (PIR > {args.pir_minutes} Min aktiv)")
         else:
-            print(f"   ❌ {r['asset_name']}: occupied setzen fehlgeschlagen", file=sys.stderr)
+            _log_line(f"   ❌ {r['asset_name']}: occupied setzen fehlgeschlagen")
 
-    # Regel 3: occupied auf false setzen, wenn 30 Min kein Trigger
+    # Regel 3: occupied auf false setzen, wenn 60 Min PIR "normal"
     for r in rows:
         if r.get("setOccupied") != "false" or r.get("setOccupied_rule") != "Regel 3":
             continue
         if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, False):
             r["occupied"] = False
-            print(f"   ✅ {r['asset_name']}: occupied auf false gesetzt (Regel 3: 30 Min kein Trigger)", file=sys.stderr)
+            _log_line(f"   ✅ {r['asset_name']}: occupied auf false gesetzt (Regel 3: 60 Min PIR normal)")
         else:
-            print(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 3)", file=sys.stderr)
+            _log_line(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 3)")
 
     # Ausgabe
     out_file = open(args.output_file, "w", encoding="utf-8", newline="") if args.output_file else sys.stdout
@@ -762,8 +765,8 @@ def main():
             out_file.close()
 
     if args.output_file:
-        print(f"Ausgabe: {args.output_file}  ({len(rows)} Assets mit hasPir)", file=sys.stderr)
-    print(f"\n✅ Fertig. {len(rows)} Asset(s) mit hasPir=true.")
+        _log_line(f"Ausgabe: {args.output_file}  ({len(rows)} Assets mit hasPir)")
+    _log_line(f"✅ Fertig. {len(rows)} Asset(s) mit hasPir=true.")
 
 
 if __name__ == "__main__":
