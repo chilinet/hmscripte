@@ -7,11 +7,13 @@ Gleiche Daten wie check_occupied (PIR/ws202), aber über ThingsBoard Web-API.
 
 - Customer-Assets: GET /api/customer/{customer_id}/assets
 - Pro Asset: Attribut hasPir = true prüfen (Asset-Attribute)
-- Related Devices zum Asset holen, nur Profil ws202
-- Von jedem ws202-Device: letzten Telemetriewert „pir“ anzeigen
+- Related Devices zum Asset holen, Profile ws202 und ws203
+- ws202: letzter Telemetriewert „pir“ (Regel 1–3)
+- ws203: Telemetrie „occupancy“ (occupied/vacant). 30 Min occupied am Stück
+  markiert das Asset für 2 Stunden als belegt (Regel 4), danach wieder frei (Regel 5)
 - Asset-Attribut „occupied“ ausgeben
 - setOccupied: "true" wenn PIR (z.B. trigger) und ts älter als 5 Min, sonst leer
-- Optional: --set-occupied-when-pir-active → bei PIR > 5 Min aktiv: occupied per API auf true setzen
+- Optional: --set-occupied-when-pir-active → occupied per API auf true setzen (Regel 1/2/4)
 - Wechselt occupied (true oder false): derselbe Wert zusätzlich als Asset-Telemetrie „occupied“
 
 Verwendung:
@@ -58,21 +60,29 @@ MSSQL_USER = os.getenv("MSSQL_USER", "")
 MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "")
 REQUEST_TIMEOUT = 30
 DEVICE_PROFILE_WS202 = "ws202"
+DEVICE_PROFILE_WS203 = "ws203"
 ASSET_ATTR_HAS_PIR = "hasPir"
 ASSET_ATTR_OCCUPIED = "occupied"
+ASSET_ATTR_OCCUPIED_UNTIL = "occupiedUntil"
 ASSET_ATTR_SCOPE = "SERVER_SCOPE"
 TELEMETRY_KEY_PIR = "pir"
+TELEMETRY_KEY_OCCUPANCY = "occupancy"
 PIR_ACTIVE_MINUTES_DEFAULT = 5
 # Regel 2: setOccupied = true wenn in den letzten RULE2_WINDOW_MINUTES Min die PIR in Summe RULE2_TRIGGER_MINUTES Min auf trigger stand
 RULE2_WINDOW_MINUTES = 10
 RULE2_TRIGGER_MINUTES = 5
 # Regel 3: setOccupied = false wenn occupied = true und PIR seit mehr als 60 Min auf "normal" steht
 RULE3_WINDOW_MINUTES = 60
+# Regel 4: ws203 occupancy durchgehend occupied → Asset 2 h belegt
+# Regel 5: Haltezeit abgelaufen und kein 30-Minuten-Stück mehr → Asset frei
+WS203_STREAK_MINUTES = 30
+WS203_HOLD_MINUTES = 120
+WS203_HISTORY_MINUTES = WS203_HOLD_MINUTES + WS203_STREAK_MINUTES
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Check Occupied über ThingsBoard REST: Assets mit hasPir, ws202-Devices, letzter pir-Wert."
+        description="Check Occupied über ThingsBoard REST: Assets mit hasPir, ws202 (pir) und ws203 (occupancy)."
     )
     parser.add_argument(
         "--customer-id",
@@ -153,7 +163,7 @@ def parse_arguments():
         "--set-occupied-when-pir-active",
         action="store_true",
         dest="set_occupied_when_pir_active",
-        help="Wenn PIR länger als --pir-minutes aktiv: Asset-Attribut occupied auf true setzen",
+        help="Regel 1/2 (PIR) und Regel 4 (ws203, 30 Min occupied): Asset-Attribut occupied auf true setzen",
     )
     parser.add_argument(
         "--pir-minutes",
@@ -348,6 +358,55 @@ def is_pir_active(value: Any) -> bool:
     return False
 
 
+def is_occupancy_occupied(value: Any) -> bool:
+    """True wenn der ws203-Wert „occupied“ ist (Raum belegt). „vacant“ ist frei."""
+    if value is None:
+        return False
+    return str(value).strip().lower() == "occupied"
+
+
+def occupancy_streak_ms(entries: List[Dict[str, Any]], now_ms: int) -> int:
+    """
+    Dauer der aktuellen occupied-Phase bis now_ms.
+    Die Phase beginnt beim ersten „occupied“ nach dem letzten „vacant“
+    und gilt nur, wenn der neueste Wert „occupied“ ist.
+    """
+    if not entries:
+        return 0
+    sorted_entries = sorted(entries, key=lambda x: x.get("ts") or 0)
+    if not is_occupancy_occupied(sorted_entries[-1].get("value")):
+        return 0
+    streak_start = None
+    for ev in reversed(sorted_entries):
+        if not is_occupancy_occupied(ev.get("value")):
+            break
+        ts = ev.get("ts")
+        if ts is not None:
+            streak_start = int(ts)
+    if streak_start is None:
+        return 0
+    return max(0, now_ms - streak_start)
+
+
+def as_epoch_ms(value: Any) -> Optional[int]:
+    """Liest einen Zeitstempel in ms aus einem Attributwert."""
+    if value is None or value is False or value is True:
+        return None
+    if isinstance(value, (int, float)):
+        ms = int(value)
+        return ms if ms > 0 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            ms = int(float(s))
+        except ValueError:
+            return None
+        return ms if ms > 0 else None
+    return None
+
+
 def set_asset_attribute(
     session: requests.Session,
     base_url: str,
@@ -366,6 +425,22 @@ def set_asset_attribute(
         return False
 
 
+def set_asset_attributes(
+    session: requests.Session,
+    base_url: str,
+    asset_id: str,
+    values: Dict[str, Any],
+    scope: str = ASSET_ATTR_SCOPE,
+) -> bool:
+    """Setzt mehrere Asset-Attribute in einem Aufruf. Returns True bei Erfolg."""
+    url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/attributes/{scope}"
+    try:
+        r = session.post(url, json=values, timeout=REQUEST_TIMEOUT)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def save_asset_telemetry(
     session: requests.Session,
     base_url: str,
@@ -375,13 +450,15 @@ def save_asset_telemetry(
 ) -> bool:
     """Schreibt Telemetriewerte auf ein Asset. Returns True bei Erfolg."""
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/timeseries/ANY"
-    payload: Dict[str, Any] = {"values": values}
-    if ts_ms is not None:
-        payload["ts"] = ts_ms
+    payload = {"ts": ts_ms if ts_ms is not None else int(time.time() * 1000), "values": values}
     try:
         r = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        return r.status_code == 200
-    except Exception:
+        if r.status_code != 200:
+            _log_line(f"   Telemetrie HTTP {r.status_code}: {r.text[:300]}")
+            return False
+        return True
+    except Exception as e:
+        _log_line(f"   Telemetrie fehlgeschlagen: {e}")
         return False
 
 
@@ -460,7 +537,7 @@ def get_telemetry_timeseries(
 ) -> List[Dict[str, Any]]:
     """Liefert PIR-Telemetrie im Zeitfenster [start_ts_ms, end_ts_ms] als Liste von {ts, value}."""
     url = f"{base_url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
-    params = {"keys": key, "startTs": start_ts_ms, "endTs": end_ts_ms}
+    params = {"keys": key, "startTs": start_ts_ms, "endTs": end_ts_ms, "limit": 1000, "orderBy": "ASC"}
     r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
     if r.status_code != 200:
         return []
@@ -584,7 +661,12 @@ def main():
         asset_id = asset_uid(asset)
         if not asset_id:
             continue
-        attrs = get_asset_attributes(session, base_url, asset_id, keys=f"{ASSET_ATTR_HAS_PIR},{ASSET_ATTR_OCCUPIED}")
+        attrs = get_asset_attributes(
+            session,
+            base_url,
+            asset_id,
+            keys=f"{ASSET_ATTR_HAS_PIR},{ASSET_ATTR_OCCUPIED},{ASSET_ATTR_OCCUPIED_UNTIL}",
+        )
         if not is_has_pir_true(attrs.get(ASSET_ATTR_HAS_PIR)):
             continue
 
@@ -599,7 +681,9 @@ def main():
         asset_name = (asset.get("name") or "").strip()
         asset_label = (asset.get("label") or "").strip()
         relations = get_relations_from_asset(session, base_url, asset_id)
+        now_ms = int(time.time() * 1000)
         ws202_devices: List[Dict[str, Any]] = []
+        ws203_devices: List[Dict[str, Any]] = []
         for rel in relations:
             to_ent = rel.get("to") or {}
             dev_id = to_ent.get("id") if isinstance(to_ent, dict) else None
@@ -612,35 +696,86 @@ def main():
             if isinstance(pid, dict):
                 pid = pid.get("id")
             profile_name = (profile_map.get(str(pid or "")) or "").strip()
-            if profile_name != DEVICE_PROFILE_WS202:
+            profile_key = profile_name.lower()
+            if profile_key not in (DEVICE_PROFILE_WS202, DEVICE_PROFILE_WS203):
                 continue
             dev_name = (device.get("name") or "").strip()
             dev_label = (device.get("label") or "").strip()
             dev_uid = device_uid(device)
-            pir_value, pir_ts = get_latest_telemetry(session, base_url, dev_uid, TELEMETRY_KEY_PIR)
-            # Regel 2: Telemetrie letzte 10 Min, Summe Trigger-Dauer
-            now_ms = int(time.time() * 1000)
-            window_start_ms = now_ms - RULE2_WINDOW_MINUTES * 60 * 1000
-            pir_entries = get_telemetry_timeseries(
-                session, base_url, dev_uid, TELEMETRY_KEY_PIR, window_start_ms, now_ms
+            if profile_key == DEVICE_PROFILE_WS202:
+                pir_value, pir_ts = get_latest_telemetry(session, base_url, dev_uid, TELEMETRY_KEY_PIR)
+                window_start_ms = now_ms - RULE2_WINDOW_MINUTES * 60 * 1000
+                pir_entries = get_telemetry_timeseries(
+                    session, base_url, dev_uid, TELEMETRY_KEY_PIR, window_start_ms, now_ms
+                )
+                trigger_sum_ms = trigger_duration_ms(pir_entries, now_ms)
+                ws202_devices.append({
+                    "device_id": dev_uid,
+                    "device_name": dev_name,
+                    "device_label": dev_label,
+                    "profile": DEVICE_PROFILE_WS202,
+                    "pir_value": pir_value,
+                    "pir_ts": pir_ts,
+                    "trigger_sum_ms": trigger_sum_ms,
+                })
+                continue
+            occ_value, occ_ts = get_latest_telemetry(session, base_url, dev_uid, TELEMETRY_KEY_OCCUPANCY)
+            hist_start_ms = now_ms - WS203_HISTORY_MINUTES * 60 * 1000
+            occ_entries = get_telemetry_timeseries(
+                session, base_url, dev_uid, TELEMETRY_KEY_OCCUPANCY, hist_start_ms, now_ms
             )
-            trigger_sum_ms = trigger_duration_ms(pir_entries, now_ms)
-            ws202_devices.append({
+            streak_ms = occupancy_streak_ms(occ_entries, now_ms)
+            ws203_devices.append({
                 "device_id": dev_uid,
                 "device_name": dev_name,
                 "device_label": dev_label,
-                "pir_value": pir_value,
-                "pir_ts": pir_ts,
-                "trigger_sum_ms": trigger_sum_ms,
+                "profile": DEVICE_PROFILE_WS203,
+                "occupancy_value": occ_value,
+                "occupancy_ts": occ_ts,
+                "occupancy_streak_ms": streak_ms,
             })
 
-        # setOccupied: Regel 1 und 2 nur wenn occupied = false; Regel 3 nur wenn occupied = true
-        # Regel 1: PIR aktiv und ts älter als pir_minutes
-        # Regel 2: In den letzten 10 Min war PIR in Summe >= 5 Min auf trigger
-        # Regel 3: PIR seit mehr als 60 Min auf "normal" → setOccupied = false
+        # ws203 (Regel 4/5) gilt für das Asset, sobald ein ws203 hängt.
+        # ws202 (Regel 1–3) nur, wenn kein ws203 vorhanden ist.
+        # Regel 4: occupancy mindestens 30 Min am Stück „occupied“ → 2 h belegt
+        # Regel 5: Haltezeit vorbei und kein 30-Minuten-Stück mehr → frei
         set_occupied = ""
         set_occupied_rule = ""
-        if occupied is False:
+        ws203_action = ""
+        occupied_until_ms: Optional[int] = None
+        if ws203_devices:
+            streak_ms = max(d.get("occupancy_streak_ms") or 0 for d in ws203_devices)
+            streak_ok = streak_ms >= WS203_STREAK_MINUTES * 60 * 1000
+            hold_until = as_epoch_ms(attrs.get(ASSET_ATTR_OCCUPIED_UNTIL))
+            hold_active = hold_until is not None and hold_until > now_ms
+            new_until = now_ms + WS203_HOLD_MINUTES * 60 * 1000
+            if streak_ok and occupied is not True:
+                ws203_action = "set_true"
+                set_occupied = "true"
+                set_occupied_rule = "Regel 4"
+                occupied_until_ms = new_until
+            elif streak_ok and occupied is True and not hold_active:
+                ws203_action = "renew"
+                set_occupied_rule = "Regel 4"
+                occupied_until_ms = new_until
+            elif occupied is True and not hold_active and not streak_ok:
+                ws203_action = "set_false"
+                set_occupied = "false"
+                set_occupied_rule = "Regel 5"
+                occupied_until_ms = 0
+            elif hold_active:
+                occupied_until_ms = hold_until
+            threshold_ms = WS203_STREAK_MINUTES * 60 * 1000
+            for d in ws203_devices:
+                if ws203_action == "set_false":
+                    d["setOccupied_rule"] = "Regel 5"
+                elif ws203_action in ("set_true", "renew") and (d.get("occupancy_streak_ms") or 0) >= threshold_ms:
+                    d["setOccupied_rule"] = "Regel 4"
+                else:
+                    d["setOccupied_rule"] = ""
+            for d in ws202_devices:
+                d["setOccupied_rule"] = ""
+        elif occupied is False:
             pir_minutes_ms = args.pir_minutes * 60 * 1000
             rule2_threshold_ms = RULE2_TRIGGER_MINUTES * 60 * 1000
             rules_applied: set = set()
@@ -660,7 +795,7 @@ def main():
                     set_occupied = "true"
             if rules_applied:
                 set_occupied_rule = ", ".join(sorted(rules_applied))
-        elif occupied is True:
+        elif occupied is True and ws202_devices:
             # Regel 3: PIR seit mehr als 60 Min "normal" = letztes PIR-Ereignis (raumweit) ist "normal" und älter als 60 Min
             rule3_min_ms = RULE3_WINDOW_MINUTES * 60 * 1000
             latest_ts = max((d.get("pir_ts") or 0) for d in ws202_devices)
@@ -691,15 +826,19 @@ def main():
             "occupied": occupied,
             "setOccupied": set_occupied,
             "setOccupied_rule": set_occupied_rule,
+            "ws203_action": ws203_action,
+            "occupied_until_ms": occupied_until_ms,
             "hasPir": True,
             "ws202_devices": ws202_devices,
+            "ws203_devices": ws203_devices,
         })
 
-    # Optional: occupied auf true setzen, wenn PIR länger als pir_minutes aktiv (Regel 1/2)
+    # Optional: occupied auf true setzen (Regel 1/2 für ws202, Regel 4 für ws203)
+    write_true = getattr(args, "set_occupied_when_pir_active", False)
     for r in rows:
-        if r.get("setOccupied") != "true":
+        if r.get("setOccupied") != "true" or r.get("ws203_action"):
             continue
-        if not getattr(args, "set_occupied_when_pir_active", False):
+        if not write_true:
             continue
         if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, True):
             r["occupied"] = True
@@ -710,18 +849,66 @@ def main():
         else:
             _log_line(f"   ❌ {r['asset_name']}: occupied setzen fehlgeschlagen")
 
-    # Regel 3: occupied auf false setzen, wenn 60 Min PIR "normal"
     for r in rows:
-        if r.get("setOccupied") != "false" or r.get("setOccupied_rule") != "Regel 3":
+        action = r.get("ws203_action")
+        if action not in ("set_true", "renew"):
             continue
-        if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, False):
-            r["occupied"] = False
-            if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: False}):
-                _log_line(f"   ✅ {r['asset_name']}: occupied auf false gesetzt, Telemetrie geschrieben (Regel 3: 60 Min PIR normal)")
+        if not write_true:
+            continue
+        until_ms = int(r.get("occupied_until_ms") or 0)
+        until_str = datetime.fromtimestamp(until_ms / 1000).strftime("%Y-%m-%d %H:%M:%S") if until_ms else "—"
+        if action == "set_true":
+            ok = set_asset_attributes(
+                session,
+                base_url,
+                r["asset_id"],
+                {ASSET_ATTR_OCCUPIED: True, ASSET_ATTR_OCCUPIED_UNTIL: until_ms},
+            )
+            if not ok:
+                _log_line(f"   ❌ {r['asset_name']}: occupied setzen fehlgeschlagen (Regel 4)")
+                continue
+            r["occupied"] = True
+            if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: True}):
+                _log_line(f"   ✅ {r['asset_name']}: occupied auf true gesetzt, Telemetrie geschrieben (Regel 4: 30 Min occupied, belegt bis {until_str})")
             else:
-                _log_line(f"   ⚠️ {r['asset_name']}: occupied auf false gesetzt, Telemetrie fehlgeschlagen (Regel 3: 60 Min PIR normal)")
+                _log_line(f"   ⚠️ {r['asset_name']}: occupied auf true gesetzt, Telemetrie fehlgeschlagen (Regel 4, belegt bis {until_str})")
+        elif set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED_UNTIL, until_ms):
+            if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: True}):
+                _log_line(f"   ✅ {r['asset_name']}: Belegung um 2 h verlängert, Telemetrie occupied=true (Regel 4, belegt bis {until_str})")
+            else:
+                _log_line(f"   ⚠️ {r['asset_name']}: Belegung um 2 h verlängert, Telemetrie fehlgeschlagen (Regel 4, belegt bis {until_str})")
         else:
-            _log_line(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 3)")
+            _log_line(f"   ❌ {r['asset_name']}: occupiedUntil verlängern fehlgeschlagen (Regel 4)")
+
+    # Regel 3: occupied auf false setzen, wenn 60 Min PIR "normal"
+    # Regel 5: ws203-Haltezeit abgelaufen und kein 30-Minuten-Stück occupied mehr
+    for r in rows:
+        if r.get("setOccupied") != "false":
+            continue
+        rule = r.get("setOccupied_rule")
+        if rule == "Regel 3":
+            if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, False):
+                r["occupied"] = False
+                if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: False}):
+                    _log_line(f"   ✅ {r['asset_name']}: occupied auf false gesetzt, Telemetrie geschrieben (Regel 3: 60 Min PIR normal)")
+                else:
+                    _log_line(f"   ⚠️ {r['asset_name']}: occupied auf false gesetzt, Telemetrie fehlgeschlagen (Regel 3: 60 Min PIR normal)")
+            else:
+                _log_line(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 3)")
+        elif rule == "Regel 5":
+            if set_asset_attributes(
+                session,
+                base_url,
+                r["asset_id"],
+                {ASSET_ATTR_OCCUPIED: False, ASSET_ATTR_OCCUPIED_UNTIL: 0},
+            ):
+                r["occupied"] = False
+                if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: False}):
+                    _log_line(f"   ✅ {r['asset_name']}: occupied auf false gesetzt, Telemetrie geschrieben (Regel 5: 2 h abgelaufen)")
+                else:
+                    _log_line(f"   ⚠️ {r['asset_name']}: occupied auf false gesetzt, Telemetrie fehlgeschlagen (Regel 5: 2 h abgelaufen)")
+            else:
+                _log_line(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 5)")
 
     # Ausgabe
     out_file = open(args.output_file, "w", encoding="utf-8", newline="") if args.output_file else sys.stdout
@@ -729,24 +916,11 @@ def main():
         if args.output == "csv":
             flat = []
             for r in rows:
-                if r["ws202_devices"]:
-                    for d in r["ws202_devices"]:
-                        flat.append({
-                            "customer_id": r["customer_id"],
-                            "asset_id": r["asset_id"],
-                            "asset_name": r["asset_name"],
-                            "asset_label": r["asset_label"],
-                            "occupied": r.get("occupied"),
-                            "setOccupied": r.get("setOccupied", ""),
-                            "setOccupied_rule": r.get("setOccupied_rule", ""),
-                            "device_id": d["device_id"],
-                            "device_name": d["device_name"],
-                            "device_label": d["device_label"],
-                            "setOccupied_rule_device": d.get("setOccupied_rule", ""),
-                            "pir_value": d.get("pir_value"),
-                            "pir_ts": d.get("pir_ts"),
-                        })
-                else:
+                sensors = list(r.get("ws202_devices") or []) + list(r.get("ws203_devices") or [])
+                if not sensors:
+                    sensors = [{}]
+                for d in sensors:
+                    streak_ms = d.get("occupancy_streak_ms")
                     flat.append({
                         "customer_id": r["customer_id"],
                         "asset_id": r["asset_id"],
@@ -755,16 +929,21 @@ def main():
                         "occupied": r.get("occupied"),
                         "setOccupied": r.get("setOccupied", ""),
                         "setOccupied_rule": r.get("setOccupied_rule", ""),
-                        "device_id": "",
-                        "device_name": "",
-                        "device_label": "",
-                        "setOccupied_rule_device": "",
-                        "pir_value": "",
-                        "pir_ts": "",
+                        "occupied_until_ms": r.get("occupied_until_ms") or "",
+                        "device_id": d.get("device_id", ""),
+                        "device_name": d.get("device_name", ""),
+                        "device_label": d.get("device_label", ""),
+                        "device_profile": d.get("profile", ""),
+                        "setOccupied_rule_device": d.get("setOccupied_rule", ""),
+                        "pir_value": d.get("pir_value", ""),
+                        "pir_ts": d.get("pir_ts", ""),
+                        "occupancy_value": d.get("occupancy_value", ""),
+                        "occupancy_streak_min": int(streak_ms / 60000) if streak_ms else "",
                     })
             fieldnames = [
                 "customer_id", "asset_id", "asset_name", "asset_label", "occupied", "setOccupied", "setOccupied_rule",
-                "device_id", "device_name", "device_label", "setOccupied_rule_device", "pir_value", "pir_ts",
+                "occupied_until_ms", "device_id", "device_name", "device_label", "device_profile",
+                "setOccupied_rule_device", "pir_value", "pir_ts", "occupancy_value", "occupancy_streak_min",
             ]
             writer = csv.DictWriter(out_file, fieldnames=fieldnames, delimiter=";")
             writer.writeheader()
@@ -772,32 +951,54 @@ def main():
         elif args.output == "json":
             json.dump(rows, out_file, indent=2, ensure_ascii=False)
         else:
-            pir_minutes_ms = args.pir_minutes * 60 * 1000
-            now_ms = int(time.time() * 1000)
             print(f"Customer-ID: {customer_id}  –  {len(rows)} Asset(s) mit hasPir=true\n", file=out_file)
             for r in rows:
                 occ = r.get("occupied")
                 occ_str = "true" if occ is True else ("false" if occ is False else "—")
                 set_occ = r.get("setOccupied") or ""
                 set_occ_rule = r.get("setOccupied_rule") or "—"
-                print(f"Asset: {r['asset_name']}  (Label: {r['asset_label']}  ID: {r['asset_id']})  occupied={occ_str}  setOccupied={set_occ or '—'}  setOccupied_rule={set_occ_rule}", file=out_file)
-                if not r["ws202_devices"]:
-                    print("   Keine ws202-Devices (Related)", file=out_file)
-                else:
-                    for d in r["ws202_devices"]:
-                        ts_str = ""
-                        if d.get("pir_ts") is not None:
-                            try:
-                                ts_str = datetime.utcfromtimestamp(d["pir_ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S UTC")
-                            except Exception:
-                                ts_str = str(d["pir_ts"])
-                        # setOccupied + Regel anzeigen: Regel 1/2 (occupied=false) → true; Regel 3 (occupied=true) → false
-                        set_occ_line = ""
-                        if occ is False and d.get("setOccupied_rule"):
-                            set_occ_line = f"  setOccupied = true ({d.get('setOccupied_rule')})"
-                        elif occ is True and d.get("setOccupied_rule") == "Regel 3":
-                            set_occ_line = "  setOccupied = false (Regel 3)"
-                        print(f"   ws202: {d.get('device_name') or d.get('device_id')}  (Label: {d.get('device_label')})  device_id={d.get('device_id', '')}  pir={d.get('pir_value')}  ts={ts_str}{set_occ_line}", file=out_file)
+                until_ms = r.get("occupied_until_ms") or 0
+                until_str = ""
+                if until_ms:
+                    try:
+                        until_str = "  occupiedUntil=" + datetime.fromtimestamp(int(until_ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        until_str = f"  occupiedUntil={until_ms}"
+                print(f"Asset: {r['asset_name']}  (Label: {r['asset_label']}  ID: {r['asset_id']})  occupied={occ_str}  setOccupied={set_occ or '—'}  setOccupied_rule={set_occ_rule}{until_str}", file=out_file)
+                if not r.get("ws202_devices") and not r.get("ws203_devices"):
+                    print("   Keine ws202/ws203-Devices (Related)", file=out_file)
+                for d in r.get("ws202_devices") or []:
+                    ts_str = ""
+                    if d.get("pir_ts") is not None:
+                        try:
+                            ts_str = datetime.utcfromtimestamp(d["pir_ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        except Exception:
+                            ts_str = str(d["pir_ts"])
+                    set_occ_line = ""
+                    if occ is False and d.get("setOccupied_rule"):
+                        set_occ_line = f"  setOccupied = true ({d.get('setOccupied_rule')})"
+                    elif occ is True and d.get("setOccupied_rule") == "Regel 3":
+                        set_occ_line = "  setOccupied = false (Regel 3)"
+                    print(f"   ws202: {d.get('device_name') or d.get('device_id')}  (Label: {d.get('device_label')})  device_id={d.get('device_id', '')}  pir={d.get('pir_value')}  ts={ts_str}{set_occ_line}", file=out_file)
+                for d in r.get("ws203_devices") or []:
+                    ts_str = ""
+                    if d.get("occupancy_ts") is not None:
+                        try:
+                            ts_str = datetime.utcfromtimestamp(d["occupancy_ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        except Exception:
+                            ts_str = str(d["occupancy_ts"])
+                    streak_min = int((d.get("occupancy_streak_ms") or 0) / 60000)
+                    set_occ_line = ""
+                    if d.get("setOccupied_rule") == "Regel 4":
+                        set_occ_line = "  setOccupied = true (Regel 4, 2 h)" if r.get("ws203_action") == "set_true" else "  Haltezeit +2 h (Regel 4)"
+                    elif d.get("setOccupied_rule") == "Regel 5":
+                        set_occ_line = "  setOccupied = false (Regel 5)"
+                    print(
+                        f"   ws203: {d.get('device_name') or d.get('device_id')}  (Label: {d.get('device_label')})  "
+                        f"device_id={d.get('device_id', '')}  occupancy={d.get('occupancy_value')}  "
+                        f"streak={streak_min} min  ts={ts_str}{set_occ_line}",
+                        file=out_file,
+                    )
                 print(file=out_file)
     finally:
         if args.output_file and out_file is not sys.stdout:
