@@ -12,15 +12,17 @@ Gleiche Daten wie check_occupied (PIR/ws202), aber über ThingsBoard Web-API.
 - Asset-Attribut „occupied“ ausgeben
 - setOccupied: "true" wenn PIR (z.B. trigger) und ts älter als 5 Min, sonst leer
 - Optional: --set-occupied-when-pir-active → bei PIR > 5 Min aktiv: occupied per API auf true setzen
+- Wechselt occupied (true oder false): derselbe Wert zusätzlich als Asset-Telemetrie „occupied“
 
 Verwendung:
-  python check_occupied_rest.py --customer-id <UUID>   # TB-Login aus MSSQL (Standard)
+  python check_occupied_rest.py --customer-id <UUID>   # TB-Login aus Profil tbconnections (Standard)
   python check_occupied_rest.py --customer-id <UUID> --no-credentials-from-db   # TB aus .env/getpass
   python check_occupied_rest.py --customer-id <UUID> --output csv -o occupied_rest.csv
   python check_occupied_rest.py --customer-id <UUID> --set-occupied-when-pir-active
 
 .env: THINGBOARD_URL, THINGBOARD_USERNAME, THINGBOARD_PASSWORD
-  Standard: ThingsBoard-Login aus MSSQL customer_settings (tb_username, tb_password) per customer_id.
+  Standard: ThingsBoard-Login aus MSSQL-Profil tbconnections
+  (customer_settings.tbconnection_id → tb_username, tb_password, tb_url).
   Mit --no-credentials-from-db: Anmeldung aus .env/CLI.
   MSSQL: MSSQL_SERVER, MSSQL_DATABASE, MSSQL_USER, MSSQL_PASSWORD
 """
@@ -120,7 +122,7 @@ def parse_arguments():
         "--no-credentials-from-db",
         action="store_true",
         dest="no_credentials_from_db",
-        help="ThingsBoard-Anmeldung aus .env/CLI statt aus MSSQL",
+        help="ThingsBoard-Anmeldung aus .env/CLI statt aus dem Profil tbconnections",
     )
     parser.add_argument(
         "--debug",
@@ -175,15 +177,15 @@ def get_tb_credentials_from_mssql(
     user: str,
     password: str,
     debug: bool = False,
-) -> Tuple[Optional[str], Optional[str]]:
-    """Holt tb_username und tb_password aus MSSQL customer_settings für die gegebene customer_id."""
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Holt tb_username, tb_password und tb_url aus dem Profil tbconnections des Customers."""
     def _log(msg: str) -> None:
         if debug:
             _log_line(f"   [DEBUG] TB aus MSSQL: {msg}")
 
-    def _fail(reason: str) -> Tuple[Optional[str], Optional[str]]:
+    def _fail(reason: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         _log_line(f"   Ursache: {reason}")
-        return None, None
+        return None, None, None
 
     try:
         import pyodbc
@@ -233,20 +235,30 @@ def get_tb_credentials_from_mssql(
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT tb_username, tb_password FROM customer_settings WHERE customer_id = ?",
+            """
+            SELECT cs.tbconnection_id, tc.tb_username, tc.tb_password, tc.tb_url
+            FROM customer_settings cs
+            LEFT JOIN tbconnections tc ON cs.tbconnection_id = tc.id
+            WHERE cs.customer_id = ?
+            """,
             (customer_id,),
         )
         row = cursor.fetchone()
         cursor.close()
-        if row and len(row) >= 2:
-            uname = str(row[0]).strip() if row[0] else None
-            pwd = str(row[1]) if row[1] else None
-            if not uname or not pwd:
-                _log(f"Eintrag für customer_id={customer_id} gefunden, aber tb_username oder tb_password leer.")
-                return _fail("Eintrag in customer_settings hat leeres tb_username oder tb_password.")
-            return (uname, pwd)
-        _log(f"Kein Eintrag in customer_settings für customer_id={customer_id} (SELECT tb_username, tb_password).")
-        return _fail(f"Kein Eintrag in customer_settings für customer_id={customer_id} (Spalten tb_username, tb_password).")
+        if not row:
+            _log(f"Kein Eintrag in customer_settings für customer_id={customer_id}.")
+            return _fail(f"Kein Eintrag in customer_settings für customer_id={customer_id}.")
+        connection_id, raw_user, raw_password, raw_url = row[0], row[1], row[2], row[3]
+        if connection_id is None:
+            _log(f"customer_id={customer_id} hat kein tbconnection_id.")
+            return _fail("customer_settings.tbconnection_id ist leer (kein Profil tbconnections).")
+        uname = str(raw_user).strip() if raw_user else None
+        pwd = str(raw_password) if raw_password else None
+        tb_url = str(raw_url).strip() if raw_url else None
+        if not uname or not pwd:
+            _log(f"Profil tbconnections id={connection_id} hat leeres tb_username oder tb_password.")
+            return _fail(f"Profil tbconnections id={connection_id} hat leeres tb_username oder tb_password.")
+        return (uname, pwd, tb_url or None)
     except Exception as e:
         _log(f"Abfrage fehlgeschlagen: {e}")
         return _fail(f"Abfrage fehlgeschlagen: {e}")
@@ -347,6 +359,25 @@ def set_asset_attribute(
     """Setzt ein Asset-Attribut. Returns True bei Erfolg."""
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/attributes/{scope}"
     payload = {key: value}
+    try:
+        r = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def save_asset_telemetry(
+    session: requests.Session,
+    base_url: str,
+    asset_id: str,
+    values: Dict[str, Any],
+    ts_ms: Optional[int] = None,
+) -> bool:
+    """Schreibt Telemetriewerte auf ein Asset. Returns True bei Erfolg."""
+    url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/timeseries/ANY"
+    payload: Dict[str, Any] = {"values": values}
+    if ts_ms is not None:
+        payload["ts"] = ts_ms
     try:
         r = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code == 200
@@ -494,14 +525,11 @@ def main():
         sys.exit(1)
 
     base_url = normalize_base_url(args.thingboard_url)
-    if not base_url:
-        _log_line("❌ ThingsBoard-URL fehlt.")
-        sys.exit(1)
 
     credentials_from_db = not getattr(args, "no_credentials_from_db", False)
     if credentials_from_db:
-        _log_line(f"📋 Hole ThingsBoard-Anmeldedaten aus MSSQL (customer_settings, customer_id={customer_id})...")
-        username, password = get_tb_credentials_from_mssql(
+        _log_line(f"📋 Hole ThingsBoard-Anmeldedaten aus MSSQL (tbconnections, customer_id={customer_id})...")
+        username, password, profile_url = get_tb_credentials_from_mssql(
             customer_id,
             args.mssql_server,
             args.mssql_database,
@@ -510,11 +538,12 @@ def main():
             debug=getattr(args, "debug", False),
         )
 
-
         if not username or not password:
             _log_line("❌ ThingsBoard-Anmeldung aus Datenbank fehlgeschlagen.")
             sys.exit(1)
-        _log_line("   ✅ Anmeldedaten aus customer_settings geladen")
+        if profile_url:
+            base_url = normalize_base_url(profile_url)
+        _log_line("   ✅ Anmeldedaten aus Profil tbconnections geladen")
     else:
         username = (args.thingboard_username or "").strip()
         if not username:
@@ -523,6 +552,10 @@ def main():
         password = args.thingboard_password
         if not password:
             password = getpass.getpass("ThingsBoard Passwort: ")
+
+    if not base_url:
+        _log_line("❌ ThingsBoard-URL fehlt (tbconnections.tb_url oder THINGBOARD_URL).")
+        sys.exit(1)
 
     verify_ssl = TB_VERIFY_SSL and not args.no_verify_ssl
     session = requests.Session()
@@ -670,7 +703,10 @@ def main():
             continue
         if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, True):
             r["occupied"] = True
-            _log_line(f"   ✅ {r['asset_name']}: occupied auf true gesetzt (PIR > {args.pir_minutes} Min aktiv)")
+            if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: True}):
+                _log_line(f"   ✅ {r['asset_name']}: occupied auf true gesetzt, Telemetrie geschrieben (PIR > {args.pir_minutes} Min aktiv)")
+            else:
+                _log_line(f"   ⚠️ {r['asset_name']}: occupied auf true gesetzt, Telemetrie fehlgeschlagen (PIR > {args.pir_minutes} Min aktiv)")
         else:
             _log_line(f"   ❌ {r['asset_name']}: occupied setzen fehlgeschlagen")
 
@@ -680,7 +716,10 @@ def main():
             continue
         if set_asset_attribute(session, base_url, r["asset_id"], ASSET_ATTR_OCCUPIED, False):
             r["occupied"] = False
-            _log_line(f"   ✅ {r['asset_name']}: occupied auf false gesetzt (Regel 3: 60 Min PIR normal)")
+            if save_asset_telemetry(session, base_url, r["asset_id"], {ASSET_ATTR_OCCUPIED: False}):
+                _log_line(f"   ✅ {r['asset_name']}: occupied auf false gesetzt, Telemetrie geschrieben (Regel 3: 60 Min PIR normal)")
+            else:
+                _log_line(f"   ⚠️ {r['asset_name']}: occupied auf false gesetzt, Telemetrie fehlgeschlagen (Regel 3: 60 Min PIR normal)")
         else:
             _log_line(f"   ❌ {r['asset_name']}: occupied auf false setzen fehlgeschlagen (Regel 3)")
 
